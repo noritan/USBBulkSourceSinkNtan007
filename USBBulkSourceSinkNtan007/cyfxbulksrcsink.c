@@ -53,6 +53,8 @@
 #include "cyfxbulksrcsink.h"
 #include "cyu3usb.h"
 #include "cyu3uart.h"
+#include "cyu3gpio.h"
+#include "cyu3utils.h"
 
 CyU3PThread     bulkSrcSinkAppThread;	 /* Application thread structure */
 CyU3PDmaChannel glChHandleBulkSink[CY_FX_N_SINK];   /* DMA MANUAL_IN channel handle.          */
@@ -101,8 +103,23 @@ CyFxAppErrorHandler (
 void
 CyFxBulkSrcSinkApplnDebugInit (void)
 {
+    CyU3PGpioClock_t  gpioClock;
     CyU3PUartConfig_t uartConfig;
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
+
+    /* Initialize the GPIO block. If we are transitioning from the boot app, we can verify whether the GPIO
+       state is retained. */
+    gpioClock.fastClkDiv = 2;
+    gpioClock.slowClkDiv = 32;
+    gpioClock.simpleDiv  = CY_U3P_GPIO_SIMPLE_DIV_BY_16;
+    gpioClock.clkSrc     = CY_U3P_SYS_CLK_BY_2;
+    gpioClock.halfDiv    = 0;
+    apiRetStatus = CyU3PGpioInit (&gpioClock, NULL);
+    if (apiRetStatus != 0)
+    {
+        /* Error handling */
+        CyFxAppErrorHandler(apiRetStatus);
+    }
 
     /* Initialize the UART for printing debug messages */
     apiRetStatus = CyU3PUartInit();
@@ -141,6 +158,8 @@ CyFxBulkSrcSinkApplnDebugInit (void)
     {
         CyFxAppErrorHandler(apiRetStatus);
     }
+
+    CyU3PDebugPreamble(CyFalse);
 }
 
 /* Callback funtion for the DMA event notification. */
@@ -623,8 +642,17 @@ CyFxBulkSrcSinkApplnUSBEventCB (
     uint16_t            evdata  /* Event data */
     )
 {
+    static uint32_t num_connect    = 0;
+    static uint32_t num_disconnect = 0;
+
     switch (evtype)
     {
+    case CY_U3P_USB_EVENT_CONNECT:
+      ++num_connect;
+      CyU3PDebugPrint (8, "CY_U3P_USB_EVENT_CONNECT detected (%d)\n",
+                       num_connect);
+      break;
+
     case CY_U3P_USB_EVENT_SETCONF:
         /* If the application is already active
          * stop it before re-enabling. */
@@ -632,6 +660,7 @@ CyFxBulkSrcSinkApplnUSBEventCB (
         {
             CyFxBulkSrcSinkApplnStop ();
         }
+
         /* Start the source sink function. */
         CyFxBulkSrcSinkApplnStart ();
         break;
@@ -644,6 +673,12 @@ CyFxBulkSrcSinkApplnUSBEventCB (
             CyFxBulkSrcSinkApplnStop ();
         }
         glDataTransStarted = CyFalse;
+
+        if (evtype == CY_U3P_USB_EVENT_DISCONNECT) {
+            ++num_disconnect;
+            CyU3PDebugPrint (8, "CY_U3P_USB_EVENT_DISCONNECT detected (%d)\n",
+                             num_disconnect);
+        }
         break;
 
     case CY_U3P_USB_EVENT_EP0_STAT_CPLT:
@@ -677,10 +712,13 @@ void
 CyFxBulkSrcSinkApplnInit (void)
 {
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
+    CyBool_t no_renum = CyFalse;
 
     /* Start the USB functionality. */
     apiRetStatus = CyU3PUsbStart();
-    if (apiRetStatus != CY_U3P_SUCCESS)
+    if (apiRetStatus == CY_U3P_ERROR_NO_REENUM_REQUIRED)
+        no_renum = CyTrue;
+    else if (apiRetStatus != CY_U3P_SUCCESS)
     {
         CyU3PDebugPrint (4, "CyU3PUsbStart failed to Start, Error code = %d\n", apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
@@ -784,13 +822,25 @@ CyFxBulkSrcSinkApplnInit (void)
     if (gl_UsbLogBuffer)
         CyU3PUsbInitEventLog (gl_UsbLogBuffer, CYFX_USBLOG_SIZE);
 
+    CyU3PDebugPrint (4, "About to connect to USB host\r\n");
+
     /* Connect the USB Pins with super speed operation enabled. */
-    apiRetStatus = CyU3PConnectState(CyTrue, CyTrue);
-    if (apiRetStatus != CY_U3P_SUCCESS)
-    {
-        CyU3PDebugPrint (4, "USB Connect failed, Error code = %d\n", apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+    if (!no_renum) {
+        apiRetStatus = CyU3PConnectState(CyTrue, CyTrue);
+        if (apiRetStatus != CY_U3P_SUCCESS)
+        {
+            CyU3PDebugPrint (4, "USB Connect failed, Error code = %d\n", apiRetStatus);
+            CyFxAppErrorHandler(apiRetStatus);
+        }
     }
+    else
+    {
+        /* USB connection is already active. Configure the endpoints and DMA channels. */
+        if (glIsApplnActive)
+            CyFxBulkSrcSinkApplnStop ();
+        CyFxBulkSrcSinkApplnStart ();
+    }
+    CyU3PDebugPrint (8, "CyFxBulkSrcSinkApplnInit complete\r\n");
 }
 
 /* Entry function for the BulkSrcSinkAppThread. */
@@ -802,8 +852,11 @@ BulkSrcSinkAppThread_Entry (
     uint32_t eventMask = CYFX_USB_CTRL_TASK | CYFX_USB_HOSTWAKE_TASK;   /* Mask representing events that we are interested in. */
     uint32_t eventStat;                                                 /* Variable to hold current status of the events. */
 
+    uint16_t prevUsbLogIndex = 0, tmp1, tmp2;
+
     /* Initialize the debug module */
     CyFxBulkSrcSinkApplnDebugInit();
+    CyU3PDebugPrint (1, "\n\ndebug initialized\r\n");
 
     /* Initialize the application */
     CyFxBulkSrcSinkApplnInit();
@@ -817,7 +870,7 @@ BulkSrcSinkAppThread_Entry (
            We cause this event wait to time out every two seconds, so that we can periodically get the FX3
            device out of low power modes.
          */
-        stat = CyU3PEventGet (&glBulkLpEvent, eventMask, CYU3P_EVENT_OR_CLEAR, &eventStat, 2000);
+        stat = CyU3PEventGet (&glBulkLpEvent, eventMask, CYU3P_EVENT_OR_CLEAR, &eventStat, 1000);
         if (stat == CY_U3P_SUCCESS)
         {
             /* If the HOSTWAKE task is set, send a DEV_NOTIFICATION (FUNCTION_WAKE) or remote wakeup signalling
@@ -839,11 +892,14 @@ BulkSrcSinkAppThread_Entry (
             {
                 uint8_t  bRequest, bReqType;
                 uint16_t wLength, temp;
+                uint16_t wValue, wIndex;
 
                 /* Decode the fields from the setup request. */
                 bReqType = (gl_setupdat0 & CY_U3P_USB_REQUEST_TYPE_MASK);
                 bRequest = ((gl_setupdat0 & CY_U3P_USB_REQUEST_MASK) >> CY_U3P_USB_REQUEST_POS);
                 wLength  = ((gl_setupdat1 & CY_U3P_USB_LENGTH_MASK)  >> CY_U3P_USB_LENGTH_POS);
+                wValue   = ((gl_setupdat0 & CY_U3P_USB_VALUE_MASK) >> CY_U3P_USB_VALUE_POS);
+                wIndex   = ((gl_setupdat1 & CY_U3P_USB_INDEX_MASK) >> CY_U3P_USB_INDEX_POS);
 
                 if ((bReqType & CY_U3P_USB_TYPE_MASK) == CY_U3P_USB_VENDOR_RQT)
                 {
@@ -893,6 +949,51 @@ BulkSrcSinkAppThread_Entry (
                             CyU3PUsbAckSetup ();
                         break;
 
+                    case 0x83:
+                        {
+                            uint32_t addr = ((uint32_t)wValue << 16) | (uint32_t)wIndex;
+                            CyU3PReadDeviceRegisters ((uvint32_t *)addr, 1, (uint32_t *)glEp0Buffer);
+                            CyU3PUsbSendEP0Data (4, glEp0Buffer);
+                        }
+                        break;
+
+                    case 0x84:
+                        {
+                            uint8_t major, minor, patch;
+
+                            if (CyU3PUsbGetBooterVersion (&major, &minor, &patch) == CY_U3P_SUCCESS)
+                            {
+                                glEp0Buffer[0] = major;
+                                glEp0Buffer[1] = minor;
+                                glEp0Buffer[2] = patch;
+                                CyU3PUsbSendEP0Data (3, glEp0Buffer);
+                            }
+                            else
+                                CyU3PUsbStall (0, CyTrue, CyFalse);
+                        }
+                        break;
+
+                    case 0x90:
+                        /* Request to switch control back to the boot firmware. */
+
+                        /* Complete the control request. */
+                        CyU3PUsbAckSetup ();
+                        CyU3PThreadSleep (10);
+
+                        /* Get rid of the DMA channels and EP configuration. */
+                        CyFxBulkSrcSinkApplnStop ();
+
+                        /* De-initialize the Debug and UART modules. */
+                        CyU3PDebugDeInit ();
+                        CyU3PUartDeInit ();
+
+                        /* Now jump back to the boot firmware image. */
+                        CyU3PUsbSetBooterSwitch (CyTrue);
+                        CyU3PUsbJumpBackToBooter (0x40078000);
+                        while (1)
+                            CyU3PThreadSleep (100);
+                        break;
+
                     default:        /* Unknown request. Stall EP0. */
                         CyU3PUsbStall (0, CyTrue, CyFalse);
                         break;
@@ -924,6 +1025,29 @@ BulkSrcSinkAppThread_Entry (
                     stat = CyU3PUsbGetLinkPowerState (&curState);
                 }
             }
+        }
+
+        {
+            /* Compare the current USB driver log index against the previous value. */
+            tmp1 = CyU3PUsbGetEventLogIndex ();
+            if (tmp1 == prevUsbLogIndex)
+            {
+                CyU3PDebugPrint (4, "USB LOG: None\r\n");
+            }
+            else
+            {
+                tmp2 = prevUsbLogIndex;
+                while (tmp2 != tmp1)
+                {
+                    CyU3PDebugPrint (4, "USB LOG: %x\r\n", gl_UsbLogBuffer[tmp2]);
+                    tmp2++;
+                    if (tmp2 == CYFX_USBLOG_SIZE)
+                        tmp2 = 0;
+                }
+            }
+
+            /* Store the current log index. */
+            prevUsbLogIndex = tmp1;
         }
     }
 }
@@ -983,18 +1107,21 @@ main (void)
     CyU3PReturnStatus_t status = CY_U3P_SUCCESS;
 
     /* Initialize the device */
-    status = CyU3PDeviceInit (NULL);
+    CyU3PSysClockConfig_t clockConfig;
+    clockConfig.setSysClk400  = CyTrue;
+    clockConfig.cpuClkDiv     = 2;
+    clockConfig.dmaClkDiv     = 2;
+    clockConfig.mmioClkDiv    = 2;
+    clockConfig.useStandbyClk = CyFalse;
+    clockConfig.clkSrc         = CY_U3P_SYS_CLK;
+    status = CyU3PDeviceInit (&clockConfig);
     if (status != CY_U3P_SUCCESS)
     {
         goto handle_fatal_error;
     }
 
-    /* Initialize the caches. Enable instruction cache and keep data cache disabled.
-     * The data cache is useful only when there is a large amount of CPU based memory
-     * accesses. When used in simple cases, it can decrease performance due to large 
-     * number of cache flushes and cleans and also it adds to the complexity of the
-     * code. */
-    status = CyU3PDeviceCacheControl (CyTrue, CyFalse, CyFalse);
+    /* Initialize the caches. Enable both Instruction and Data caches. */
+    status = CyU3PDeviceCacheControl (CyTrue, CyTrue, CyTrue);
     if (status != CY_U3P_SUCCESS)
     {
         goto handle_fatal_error;
@@ -1010,8 +1137,9 @@ main (void)
     io_cfg.useI2S    = CyFalse;
     io_cfg.useSpi    = CyFalse;
     io_cfg.lppMode   = CY_U3P_IO_MATRIX_LPP_UART_ONLY;
+
     /* No GPIOs are enabled. */
-    io_cfg.gpioSimpleEn[0]  = 0;
+    io_cfg.gpioSimpleEn[0]  = 0x00200000;               /* GPIO[21] is selected as simple GPIO. */
     io_cfg.gpioSimpleEn[1]  = 0;
     io_cfg.gpioComplexEn[0] = 0;
     io_cfg.gpioComplexEn[1] = 0;
