@@ -64,6 +64,9 @@ CyBool_t glIsApplnActive = CyFalse;      /* Whether the source sink application 
 uint32_t glDMARxCount = 0;               /* Counter to track the number of buffers received. */
 uint32_t glDMATxCount = 0;               /* Counter to track the number of buffers transmitted. */
 CyBool_t glDataTransStarted = CyFalse;   /* Whether DMA transfer has been started after enumeration. */
+CyBool_t StandbyModeEnable  = CyFalse;   /* Whether standby mode entry is enabled. */
+CyBool_t TriggerStandbyMode = CyFalse;   /* Request to initiate standby entry. */
+CyBool_t glForceLinkU2      = CyFalse;   /* Whether the device should try to initiate U2 mode. */
 
 volatile uint32_t glEp0StatCount = 0;           /* Number of EP0 status events received. */
 uint8_t glEp0Buffer[32] __attribute__ ((aligned (32))); /* Local buffer used for vendor command handling. */
@@ -78,6 +81,12 @@ uint32_t   gl_setupdat1;        /* Variable that holds the setupdat1 value (wInd
 /* Buffer used for USB event logs. */
 uint8_t *gl_UsbLogBuffer = NULL;
 #define CYFX_USBLOG_SIZE        (0x1000)
+
+/* GPIO used for testing IO state retention when switching from boot firmware to full firmware. */
+#define FX3_GPIO_TEST_OUT               (50)
+#define FX3_GPIO_TO_LOFLAG(gpio)        (1 << (gpio))
+#define FX3_GPIO_TO_HIFLAG(gpio)        (1 << ((gpio) - 32))
+
 
 /* Application Error Handler */
 void
@@ -115,10 +124,21 @@ CyFxBulkSrcSinkApplnDebugInit (void)
     gpioClock.clkSrc     = CY_U3P_SYS_CLK_BY_2;
     gpioClock.halfDiv    = 0;
     apiRetStatus = CyU3PGpioInit (&gpioClock, NULL);
-    if (apiRetStatus != 0)
+
+    /* When FX3 is restarting from standby mode, the GPIO block would already be ON and need not be started
+       again. */
+    if ((apiRetStatus != 0) && (apiRetStatus != CY_U3P_ERROR_ALREADY_STARTED))
     {
-        /* Error handling */
         CyFxAppErrorHandler(apiRetStatus);
+    }
+    else
+    {
+        /* Set the test GPIO as an output and update the value to 1. */
+        CyU3PGpioSimpleConfig_t testConf = {CyTrue, CyTrue, CyTrue, CyFalse, CY_U3P_GPIO_NO_INTR};
+
+        apiRetStatus = CyU3PGpioSetSimpleConfig (FX3_GPIO_TEST_OUT, &testConf);
+        if (apiRetStatus != 0)
+            CyFxAppErrorHandler (apiRetStatus);
     }
 
     /* Initialize the UART for printing debug messages */
@@ -569,22 +589,25 @@ CyFxBulkSrcSinkApplnUSBSetupCB (
                     || (bRequest == CY_U3P_USB_SC_CLEAR_FEATURE)) && (wValue == 0))
         {
             if (glIsApplnActive)
+            {
                 CyU3PUsbAckSetup ();
+
+                /* As we have only one interface, the link can be pushed into U2 state as soon as
+                   this interface is suspended.
+                 */
+                if (bRequest == CY_U3P_USB_SC_SET_FEATURE)
+                {
+                    glDataTransStarted = CyFalse;
+                    glForceLinkU2      = CyTrue;
+                }
+                else
+                {
+                    glForceLinkU2 = CyFalse;
+                }
+            }
             else
                 CyU3PUsbStall (0, CyTrue, CyFalse);
 
-            isHandled = CyTrue;
-        }
-
-        /* Handle Microsoft OS String Descriptor request. */
-        if ((bTarget == CY_U3P_USB_TARGET_DEVICE) && (bRequest == CY_U3P_USB_SC_GET_DESCRIPTOR) &&
-                (wValue == ((CY_U3P_USB_STRING_DESCR << 8) | 0xEE)))
-        {
-            /* Make sure we do not send more data than requested. */
-            if (wLength > CyFxUsbOSDscr[0])
-                wLength = CyFxUsbOSDscr[0];
-
-            CyU3PUsbSendEP0Data (wLength, (uint8_t *)CyFxUsbOSDscr);
             isHandled = CyTrue;
         }
 
@@ -667,6 +690,8 @@ CyFxBulkSrcSinkApplnUSBEventCB (
 
     case CY_U3P_USB_EVENT_RESET:
     case CY_U3P_USB_EVENT_DISCONNECT:
+        glForceLinkU2 = CyFalse;
+
         /* Stop the source sink function. */
         if (glIsApplnActive)
         {
@@ -683,6 +708,14 @@ CyFxBulkSrcSinkApplnUSBEventCB (
 
     case CY_U3P_USB_EVENT_EP0_STAT_CPLT:
         glEp0StatCount++;
+        break;
+
+    case CY_U3P_USB_EVENT_VBUS_REMOVED:
+        if (StandbyModeEnable)
+        {
+            TriggerStandbyMode = CyTrue;
+            StandbyModeEnable  = CyFalse;
+        }
         break;
 
     default:
@@ -853,6 +886,7 @@ BulkSrcSinkAppThread_Entry (
     uint32_t eventStat;                                                 /* Variable to hold current status of the events. */
 
     uint16_t prevUsbLogIndex = 0, tmp1, tmp2;
+    CyU3PUsbLinkPowerMode curState;
 
     /* Initialize the debug module */
     CyFxBulkSrcSinkApplnDebugInit();
@@ -867,10 +901,10 @@ BulkSrcSinkAppThread_Entry (
            The eventStat variable will hold the events that were active at the time of returning from this API.
            The CLEAR flag means that all events will be atomically cleared before this function returns.
           
-           We cause this event wait to time out every two seconds, so that we can periodically get the FX3
+           We cause this event wait to time out every 10 milli-seconds, so that we can periodically get the FX3
            device out of low power modes.
          */
-        stat = CyU3PEventGet (&glBulkLpEvent, eventMask, CYU3P_EVENT_OR_CLEAR, &eventStat, 1000);
+        stat = CyU3PEventGet (&glBulkLpEvent, eventMask, CYU3P_EVENT_OR_CLEAR, &eventStat, 10);
         if (stat == CY_U3P_SUCCESS)
         {
             /* If the HOSTWAKE task is set, send a DEV_NOTIFICATION (FUNCTION_WAKE) or remote wakeup signalling
@@ -994,6 +1028,22 @@ BulkSrcSinkAppThread_Entry (
                             CyU3PThreadSleep (100);
                         break;
 
+                    case 0xE0:
+                        /* Request to reset the FX3 device. */
+                        CyU3PUsbAckSetup ();
+                        CyU3PThreadSleep (2000);
+                        CyU3PConnectState (CyFalse, CyTrue);
+                        CyU3PThreadSleep (1000);
+                        CyU3PDeviceReset (CyFalse);
+                        CyU3PThreadSleep (1000);
+                        break;
+
+                    case 0xE1:
+                        /* Request to place FX3 in standby when VBus is next disconnected. */
+                        StandbyModeEnable = CyTrue;
+                        CyU3PUsbAckSetup ();
+                        break;
+
                     default:        /* Unknown request. Stall EP0. */
                         CyU3PUsbStall (0, CyTrue, CyFalse);
                         break;
@@ -1008,8 +1058,19 @@ BulkSrcSinkAppThread_Entry (
         }
 
         /* Try to get the USB 3.0 link back to U0. */
+        if (glForceLinkU2)
         {
-            CyU3PUsbLinkPowerMode curState;
+            stat = CyU3PUsbGetLinkPowerState (&curState);
+            while ((glForceLinkU2) && (stat == CY_U3P_SUCCESS) && (curState == CyU3PUsbLPM_U0))
+            {
+                /* Repeatedly try to go into U2 state.*/
+                CyU3PUsbSetLinkPowerState (CyU3PUsbLPM_U2);
+                CyU3PThreadSleep (5);
+                stat = CyU3PUsbGetLinkPowerState (&curState);
+            }
+        }
+        else
+        {
 
             /* Once data transfer has started, we keep trying to get the USB link to stay in U0. If this is done
                before data transfers have started, there is a likelihood of failing the TD 9.24 U1/U2 test. */
@@ -1027,14 +1088,37 @@ BulkSrcSinkAppThread_Entry (
             }
         }
 
+        if (TriggerStandbyMode)
+        {
+            TriggerStandbyMode = CyFalse;
+
+            CyU3PConnectState (CyFalse, CyTrue);
+            CyU3PUsbStop ();
+            CyU3PDebugDeInit ();
+            CyU3PUartDeInit ();
+
+            /* VBus has been turned off. Go into standby mode and wait for VBus to be turned on again.
+               The I-TCM content and GPIO register state will be backed up in the memory area starting
+               at address 0x40060000. */
+            stat = CyU3PSysEnterStandbyMode (CY_U3P_SYS_USB_VBUS_WAKEUP_SRC, CY_U3P_SYS_USB_VBUS_WAKEUP_SRC,
+                    (uint8_t *)0x40060000);
+            if (stat != CY_U3P_SUCCESS)
+            {
+                CyFxBulkSrcSinkApplnDebugInit ();
+                CyU3PDebugPrint (4, "Enter standby returned %d\r\n", stat);
+                CyFxAppErrorHandler (stat);
+            }
+
+            /* If the entry into standby succeeds, the CyU3PSysEnterStandbyMode function never returns. The
+               firmware application starts running again from the main entry point. Therefore, this code
+               will never be executed. */
+            CyFxAppErrorHandler (1);
+        }
+        else
         {
             /* Compare the current USB driver log index against the previous value. */
             tmp1 = CyU3PUsbGetEventLogIndex ();
-            if (tmp1 == prevUsbLogIndex)
-            {
-                CyU3PDebugPrint (4, "USB LOG: None\r\n");
-            }
-            else
+            if (tmp1 != prevUsbLogIndex)
             {
                 tmp2 = prevUsbLogIndex;
                 while (tmp2 != tmp1)
@@ -1139,8 +1223,8 @@ main (void)
     io_cfg.lppMode   = CY_U3P_IO_MATRIX_LPP_UART_ONLY;
 
     /* No GPIOs are enabled. */
-    io_cfg.gpioSimpleEn[0]  = 0x00200000;               /* GPIO[21] is selected as simple GPIO. */
-    io_cfg.gpioSimpleEn[1]  = 0;
+    io_cfg.gpioSimpleEn[0]  = 0;
+    io_cfg.gpioSimpleEn[1]  = FX3_GPIO_TO_HIFLAG(FX3_GPIO_TEST_OUT);
     io_cfg.gpioComplexEn[0] = 0;
     io_cfg.gpioComplexEn[1] = 0;
     status = CyU3PDeviceConfigureIOMatrix (&io_cfg);
